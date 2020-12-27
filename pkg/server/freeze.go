@@ -2,7 +2,7 @@
 // The use of this source code is goverened by a BSD-style
 // license that can be found in the LICENSE-file.
 
-package main
+package grumble
 
 import (
 	"errors"
@@ -52,7 +52,7 @@ func (server *Server) openFreezeLog() error {
 		server.freezelog = nil
 	}
 
-	logfn := filepath.Join(Args.DataDir, "servers", strconv.FormatInt(server.Id, 10), "log.fz")
+	logfn := filepath.Join(server.datadir, "servers", strconv.FormatInt(server.Id, 10), "log.fz")
 	err := os.Remove(logfn)
 	if os.IsNotExist(err) {
 		// fallthrough
@@ -199,7 +199,7 @@ func (channel *Channel) Freeze() (fc *freezer.Channel, err error) {
 
 	// Add linked channels
 	links := []uint32{}
-	for cid, _ := range channel.Links {
+	for cid := range channel.Links {
 		links = append(links, uint32(cid))
 	}
 	fc.Links = links
@@ -374,13 +374,13 @@ func FreezeGroup(group acl.Group) (*freezer.Group, error) {
 // Once both the full server and the log file has been merged together
 // in memory, a new full seralized server will be written and synced to
 // disk, and the existing log file will be removed.
-func NewServerFromFrozen(name string) (s *Server, err error) {
+func NewServerFromFrozen(name, datadir string) (s *Server, err error) {
 	id, err := strconv.ParseInt(name, 10, 64)
 	if err != nil {
 		return nil, err
 	}
 
-	path := filepath.Join(Args.DataDir, "servers", name)
+	path := filepath.Join(datadir, "servers", name)
 	mainFile := filepath.Join(path, "main.fz")
 	backupFile := filepath.Join(path, "backup.fz")
 	logFn := filepath.Join(path, "log.fz")
@@ -420,7 +420,7 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 		}
 	}
 
-	s, err = NewServer(id)
+	s, err = NewServer(id, datadir)
 	if err != nil {
 		return nil, err
 	}
@@ -669,7 +669,7 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 		if len(channel.Links) > 0 {
 			links := channel.Links
 			channel.Links = make(map[int]*Channel)
-			for chanId, _ := range links {
+			for chanId := range links {
 				targetChannel := s.Channels[chanId]
 				if targetChannel != nil {
 					s.LinkChannels(channel, targetChannel)
@@ -760,7 +760,7 @@ func (server *Server) UpdateFrozenChannel(channel *Channel, state *mumbleproto.C
 	}
 	if len(state.LinksAdd) > 0 || len(state.LinksRemove) > 0 {
 		links := []uint32{}
-		for cid, _ := range channel.Links {
+		for cid := range channel.Links {
 			links = append(links, uint32(cid))
 		}
 		fc.Links = links

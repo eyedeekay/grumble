@@ -2,7 +2,7 @@
 // The use of this source code is goverened by a BSD-style
 // license that can be found in the LICENSE-file.
 
-package main
+package grumble
 
 import (
 	"bufio"
@@ -601,7 +601,7 @@ func (client *Client) sendChannelTree(channel *Channel) {
 		if client.Version >= 0x10202 {
 			chanstate.DescriptionHash = channel.DescriptionBlobHashBytes()
 		} else {
-			buf, err := blobStore.Get(channel.DescriptionBlob)
+			buf, err := BlobStore.Get(channel.DescriptionBlob)
 			if err != nil {
 				panic("Blobstore error.")
 			}
@@ -616,7 +616,7 @@ func (client *Client) sendChannelTree(channel *Channel) {
 	chanstate.Position = proto.Int32(int32(channel.Position))
 
 	links := []uint32{}
-	for cid, _ := range channel.Links {
+	for cid := range channel.Links {
 		links = append(links, uint32(cid))
 	}
 	chanstate.Links = links

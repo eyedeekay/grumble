@@ -14,10 +14,10 @@ import (
 
 	"mumble.info/grumble/pkg/blobstore"
 	"mumble.info/grumble/pkg/logtarget"
+	"mumble.info/grumble/pkg/server"
 )
 
-var servers map[int64]*Server
-var blobStore blobstore.BlobStore
+var servers map[int64]*grumble.Server
 
 func main() {
 	var err error
@@ -59,7 +59,7 @@ func main() {
 	if err != nil && !os.IsExist(err) {
 		log.Fatalf("Unable to create blob directory (%v): %v", blobDir, err)
 	}
-	blobStore = blobstore.Open(blobDir)
+	grumble.BlobStore = blobstore.Open(blobDir)
 
 	// Check whether we should regenerate the default global keypair
 	// and corresponding certificate.
@@ -111,7 +111,7 @@ func main() {
 	}
 
 	// Should we import data from a Murmur SQLite file?
-	if SQLiteSupport && len(Args.SQLiteDB) > 0 {
+	if grumble.SQLiteSupport && len(Args.SQLiteDB) > 0 {
 		f, err := os.Open(Args.DataDir)
 		if err != nil {
 			log.Fatalf("Murmur import failed: %s", err.Error())
@@ -136,7 +136,7 @@ func main() {
 		}
 
 		log.Printf("Importing Murmur data from '%s'", Args.SQLiteDB)
-		if err = MurmurImport(Args.SQLiteDB); err != nil {
+		if err = grumble.MurmurImport(Args.SQLiteDB, Args.DataDir); err != nil {
 			log.Fatalf("Murmur import failed: %s", err.Error())
 		}
 
@@ -173,11 +173,11 @@ func main() {
 
 	// Look through the list of files in the data directory, and
 	// load all virtual servers from disk.
-	servers = make(map[int64]*Server)
+	servers = make(map[int64]*grumble.Server)
 	for _, name := range names {
 		if matched, _ := regexp.MatchString("^[0-9]+$", name); matched {
 			log.Printf("Loading server %v", name)
-			s, err := NewServerFromFrozen(name)
+			s, err := grumble.NewServerFromFrozen(name, Args.DataDir)
 			if err != nil {
 				log.Fatalf("Unable to load server: %v", err.Error())
 			}
@@ -191,7 +191,7 @@ func main() {
 
 	// If no servers were found, create the default virtual server.
 	if len(servers) == 0 {
-		s, err := NewServer(1)
+		s, err := grumble.NewServer(1, Args.DataDir)
 		if err != nil {
 			log.Fatalf("Couldn't start server: %s", err.Error())
 		}

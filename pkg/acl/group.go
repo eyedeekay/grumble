@@ -49,7 +49,7 @@ func (group *Group) AddContains(id int) (ok bool) {
 // AddUsers gets the list of user ids in the Add set.
 func (group *Group) AddUsers() []int {
 	users := []int{}
-	for uid, _ := range group.Add {
+	for uid := range group.Add {
 		users = append(users, uid)
 	}
 	return users
@@ -64,7 +64,7 @@ func (group *Group) RemoveContains(id int) (ok bool) {
 // RemoveUsers gets the list of user ids in the Remove set.
 func (group *Group) RemoveUsers() []int {
 	users := []int{}
-	for uid, _ := range group.Remove {
+	for uid := range group.Remove {
 		users = append(users, uid)
 	}
 	return users
@@ -105,10 +105,10 @@ func (group *Group) MembersInContext(ctx *Context) map[int]bool {
 	}
 
 	for _, curgroup := range groups {
-		for uid, _ := range curgroup.Add {
+		for uid := range curgroup.Add {
 			members[uid] = true
 		}
-		for uid, _ := range curgroup.Remove {
+		for uid := range curgroup.Remove {
 			delete(members, uid)
 		}
 	}

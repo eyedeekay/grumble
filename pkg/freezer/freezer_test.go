@@ -18,7 +18,7 @@ import (
 
 var testValues []proto.Message = []proto.Message{
 	&ConfigKeyValuePair{Key: proto.String("Foo")},
-	&BanList{Bans: []*Ban{&Ban{Mask: proto.Uint32(32)}}},
+	&BanList{Bans: []*Ban{{Mask: proto.Uint32(32)}}},
 	&User{Id: proto.Uint32(0), Name: proto.String("SuperUser")},
 	&UserRemove{Id: proto.Uint32(0)},
 	&Channel{Id: proto.Uint32(0), Name: proto.String("RootChannel")},

@@ -4,7 +4,7 @@
 
 // +build !windows
 
-package main
+package grumble
 
 import (
 	"io/ioutil"
@@ -30,7 +30,7 @@ func (server *Server) freezeToFile() (err error) {
 	if err != nil {
 		return err
 	}
-	f, err := ioutil.TempFile(filepath.Join(Args.DataDir, "servers", strconv.FormatInt(server.Id, 10)), ".main.fz_")
+	f, err := ioutil.TempFile(filepath.Join(server.datadir, "servers", strconv.FormatInt(server.Id, 10)), ".main.fz_")
 	if err != nil {
 		return err
 	}
@@ -50,7 +50,7 @@ func (server *Server) freezeToFile() (err error) {
 	if err != nil {
 		return err
 	}
-	err = os.Rename(f.Name(), filepath.Join(Args.DataDir, "servers", strconv.FormatInt(server.Id, 10), "main.fz"))
+	err = os.Rename(f.Name(), filepath.Join(server.datadir, "servers", strconv.FormatInt(server.Id, 10), "main.fz"))
 	if err != nil {
 		return err
 	}

@@ -2,7 +2,7 @@
 // The use of this source code is goverened by a BSD-style
 // license that can be found in the LICENSE-file.
 
-package main
+package grumble
 
 import (
 	"bufio"
@@ -62,9 +62,9 @@ type KeyValuePair struct {
 type Server struct {
 	Id int64
 
-	tcpl      *net.TCPListener
+	tcpl      net.Listener
 	tlsl      net.Listener
-	udpconn   *net.UDPConn
+	udpconn   net.PacketConn
 	tlscfg    *tls.Config
 	webwsl    *web.Listener
 	webtlscfg *tls.Config
@@ -122,6 +122,7 @@ type Server struct {
 
 	// Logging
 	*log.Logger
+	datadir string
 }
 
 type clientLogForwarder struct {
@@ -138,10 +139,11 @@ func (lf clientLogForwarder) Write(incoming []byte) (int, error) {
 }
 
 // Allocate a new Murmur instance
-func NewServer(id int64) (s *Server, err error) {
+func NewServer(id int64, datadir string) (s *Server, err error) {
 	s = new(Server)
 
 	s.Id = id
+	s.datadir = datadir
 
 	s.cfg = serverconf.New(nil)
 
@@ -653,7 +655,7 @@ func (server *Server) finishAuthenticate(client *Client) {
 			if client.Version >= 0x10203 {
 				userstate.TextureHash = client.user.TextureBlobHashBytes()
 			} else {
-				buf, err := blobStore.Get(client.user.TextureBlob)
+				buf, err := BlobStore.Get(client.user.TextureBlob)
 				if err != nil {
 					server.Panicf("Blobstore error: %v", err.Error())
 				}
@@ -666,7 +668,7 @@ func (server *Server) finishAuthenticate(client *Client) {
 			if client.Version >= 0x10203 {
 				userstate.CommentHash = client.user.CommentBlobHashBytes()
 			} else {
-				buf, err := blobStore.Get(client.user.CommentBlob)
+				buf, err := BlobStore.Get(client.user.CommentBlob)
 				if err != nil {
 					server.Panicf("Blobstore error: %v", err.Error())
 				}
@@ -837,7 +839,7 @@ func (server *Server) sendUserList(client *Client) {
 				if client.Version >= 0x10203 {
 					userstate.TextureHash = connectedClient.user.TextureBlobHashBytes()
 				} else {
-					buf, err := blobStore.Get(connectedClient.user.TextureBlob)
+					buf, err := BlobStore.Get(connectedClient.user.TextureBlob)
 					if err != nil {
 						server.Panicf("Blobstore error: %v", err.Error())
 					}
@@ -850,7 +852,7 @@ func (server *Server) sendUserList(client *Client) {
 				if client.Version >= 0x10203 {
 					userstate.CommentHash = connectedClient.user.CommentBlobHashBytes()
 				} else {
-					buf, err := blobStore.Get(connectedClient.user.CommentBlob)
+					buf, err := BlobStore.Get(connectedClient.user.CommentBlob)
 					if err != nil {
 						server.Panicf("Blobstore error: %v", err.Error())
 					}
@@ -1460,8 +1462,8 @@ func (server *Server) Start() (err error) {
 	*/
 
 	// Wrap a TLS listener around the TCP connection
-	certFn := filepath.Join(Args.DataDir, "cert.pem")
-	keyFn := filepath.Join(Args.DataDir, "key.pem")
+	certFn := filepath.Join(server.datadir, "cert.pem")
+	keyFn := filepath.Join(server.datadir, "key.pem")
 	cert, err := tls.LoadX509KeyPair(certFn, keyFn)
 	if err != nil {
 		return err

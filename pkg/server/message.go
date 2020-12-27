@@ -2,7 +2,7 @@
 // The use of this source code is goverened by a BSD-style
 // license that can be found in the LICENSE-file.
 
-package main
+package grumble
 
 import (
 	"crypto/aes"
@@ -14,6 +14,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/ban"
+	"mumble.info/grumble/pkg/blobstore"
 	"mumble.info/grumble/pkg/freezer"
 	"mumble.info/grumble/pkg/mumbleproto"
 )
@@ -23,6 +24,8 @@ type Message struct {
 	kind   uint16
 	client *Client
 }
+
+var BlobStore blobstore.BlobStore
 
 type VoiceBroadcast struct {
 	// The client who is performing the broadcast
@@ -252,7 +255,7 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 
 		key := ""
 		if len(description) > 0 {
-			key, err = blobStore.Put([]byte(description))
+			key, err = BlobStore.Put([]byte(description))
 			if err != nil {
 				server.Panicf("Blobstore error: %v", err)
 			}
@@ -434,7 +437,7 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 			if len(description) == 0 {
 				channel.DescriptionBlob = ""
 			} else {
-				key, err := blobStore.Put([]byte(description))
+				key, err := BlobStore.Put([]byte(description))
 				if err != nil {
 					server.Panicf("Blobstore error: %v", err)
 				}
@@ -700,7 +703,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 	broadcast := false
 
 	if userstate.Texture != nil && target.user != nil {
-		key, err := blobStore.Put(userstate.Texture)
+		key, err := BlobStore.Put(userstate.Texture)
 		if err != nil {
 			server.Panicf("Blobstore error: %v", err)
 			return
@@ -741,7 +744,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 	}
 
 	if userstate.Comment != nil && target.user != nil {
-		key, err := blobStore.Put([]byte(*userstate.Comment))
+		key, err := BlobStore.Put([]byte(*userstate.Comment))
 		if err != nil {
 			server.Panicf("Blobstore error: %v", err)
 		}
@@ -1129,20 +1132,20 @@ func (server *Server) handleAclMessage(client *Client, msg *Message) {
 			// message that maps user ids to usernames.
 			if hasgroup {
 				toadd := map[int]bool{}
-				for uid, _ := range group.Add {
+				for uid := range group.Add {
 					users[uid] = true
 					toadd[uid] = true
 				}
-				for uid, _ := range group.Remove {
+				for uid := range group.Remove {
 					users[uid] = true
 					delete(toadd, uid)
 				}
-				for uid, _ := range toadd {
+				for uid := range toadd {
 					mpgroup.Add = append(mpgroup.Add, uint32(uid))
 				}
 			}
 			if haspgroup {
-				for uid, _ := range pgroup.MembersInContext(&parent.ACL) {
+				for uid := range pgroup.MembersInContext(&parent.ACL) {
 					users[uid] = true
 					mpgroup.InheritedMembers = append(mpgroup.InheritedMembers, uint32(uid))
 				}
@@ -1158,7 +1161,7 @@ func (server *Server) handleAclMessage(client *Client, msg *Message) {
 
 		// Map the user ids in the user map to usernames of users.
 		queryusers := &mumbleproto.QueryUsers{}
-		for uid, _ := range users {
+		for uid := range users {
 			user, ok := server.Users[uint32(uid)]
 			if !ok {
 				client.Printf("Invalid user id in ACL")
@@ -1476,7 +1479,7 @@ func (server *Server) handleRequestBlob(client *Client, msg *Message) {
 					continue
 				}
 				if target.user.HasTexture() {
-					buf, err := blobStore.Get(target.user.TextureBlob)
+					buf, err := BlobStore.Get(target.user.TextureBlob)
 					if err != nil {
 						server.Panicf("Blobstore error: %v", err)
 						return
@@ -1501,7 +1504,7 @@ func (server *Server) handleRequestBlob(client *Client, msg *Message) {
 					continue
 				}
 				if target.user.HasComment() {
-					buf, err := blobStore.Get(target.user.CommentBlob)
+					buf, err := BlobStore.Get(target.user.CommentBlob)
 					if err != nil {
 						server.Panicf("Blobstore error: %v", err)
 						return
@@ -1526,7 +1529,7 @@ func (server *Server) handleRequestBlob(client *Client, msg *Message) {
 			if channel, ok := server.Channels[int(cid)]; ok {
 				if channel.HasDescription() {
 					chanstate.Reset()
-					buf, err := blobStore.Get(channel.DescriptionBlob)
+					buf, err := BlobStore.Get(channel.DescriptionBlob)
 					if err != nil {
 						server.Panicf("Blobstore error: %v", err)
 						return

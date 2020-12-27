@@ -2,7 +2,7 @@
 // The use of this source code is goverened by a BSD-style
 // license that can be found in the LICENSE-file.
 
-package main
+package grumble
 
 // This file implements a Server that can be created from a Murmur SQLite file.
 // This is read-only, so it's not generally useful.  It's meant as a convenient
@@ -39,7 +39,7 @@ const (
 const SQLiteSupport = true
 
 // Import the structure of an existing Murmur SQLite database.
-func MurmurImport(filename string) (err error) {
+func MurmurImport(filename, datadir string) (err error) {
 	db, err := sql.Open("sqlite", filename)
 	if err != nil {
 		panic(err.Error())
@@ -63,12 +63,12 @@ func MurmurImport(filename string) (err error) {
 	log.Printf("Found servers: %v (%v servers)", serverids, len(serverids))
 
 	for _, sid := range serverids {
-		m, err := NewServerFromSQLite(sid, db)
+		m, err := NewServerFromSQLite(sid, db, datadir)
 		if err != nil {
 			return err
 		}
 
-		err = os.Mkdir(filepath.Join(Args.DataDir, strconv.FormatInt(sid, 10)), 0750)
+		err = os.Mkdir(filepath.Join(datadir, strconv.FormatInt(sid, 10)), 0750)
 		if err != nil {
 			return err
 		}
@@ -85,8 +85,8 @@ func MurmurImport(filename string) (err error) {
 }
 
 // Create a new Server from a Murmur SQLite database
-func NewServerFromSQLite(id int64, db *sql.DB) (s *Server, err error) {
-	s, err = NewServer(id)
+func NewServerFromSQLite(id int64, db *sql.DB, datadir string) (s *Server, err error) {
+	s, err = NewServer(id, datadir)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +149,7 @@ func populateChannelInfoFromDatabase(server *Server, c *Channel, db *sql.DB) err
 		}
 
 		if len(description) > 0 {
-			key, err := blobStore.Put([]byte(description))
+			key, err := BlobStore.Put([]byte(description))
 			if err != nil {
 				return err
 			}
@@ -345,7 +345,7 @@ func populateChannelsFromDatabase(server *Server, db *sql.DB, parentId int) erro
 	}
 
 	// Add subchannels
-	for id, _ := range parent.children {
+	for id := range parent.children {
 		err = populateChannelsFromDatabase(server, db, id)
 		if err != nil {
 			return err
@@ -429,7 +429,7 @@ func populateUsers(server *Server, db *sql.DB) (err error) {
 		}
 
 		if len(Texture) > 0 {
-			key, err := blobStore.Put(Texture)
+			key, err := BlobStore.Put(Texture)
 			if err != nil {
 				return err
 			}
@@ -469,7 +469,7 @@ func populateUsers(server *Server, db *sql.DB) (err error) {
 			case UserInfoEmail:
 				user.Email = Value
 			case UserInfoComment:
-				key, err := blobStore.Put([]byte(Value))
+				key, err := BlobStore.Put([]byte(Value))
 				if err != nil {
 					return err
 				}
