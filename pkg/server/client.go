@@ -10,11 +10,17 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"runtime"
 	"time"
+	//	"os"
+
+	"github.com/eyedeekay/sam3"
+	//	"github.com/eyedeekay/sam3/helper"
+	"github.com/eyedeekay/sam3/i2pkeys"
 
 	"github.com/golang/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
@@ -30,12 +36,15 @@ type Client struct {
 	lf *clientLogForwarder
 
 	// Connection-related
-	tcpaddr *net.TCPAddr
-	udpaddr *net.UDPAddr
-	conn    net.Conn
-	reader  *bufio.Reader
-	state   int
-	server  *Server
+	StreamAddr net.Addr
+	PacketAddr net.Addr
+	SAM        sam3.SAM
+	conn       net.Conn
+	reader     *bufio.Reader
+	state      int
+	server     *Server
+	i2pkeys    string
+	i2p        bool
 
 	udprecv chan []byte
 
@@ -169,6 +178,34 @@ func (client *Client) Panic(v ...interface{}) {
 func (client *Client) Panicf(format string, v ...interface{}) {
 	client.Printf(format, v...)
 	client.Disconnect()
+}
+
+func (client *Client) SetDatagramAddr(addr net.Addr) error {
+	switch t := addr.(type) {
+	case i2pkeys.I2PAddr:
+		client.PacketAddr = addr
+	case i2pkeys.I2PKeys:
+		client.PacketAddr = addr
+	case *net.UDPAddr:
+		client.PacketAddr = addr
+	default:
+		return fmt.Errorf("Wrong address type %s", t)
+	}
+	return fmt.Errorf("Wrong address type %s", addr)
+}
+
+func (client *Client) SetStreamAddr(addr net.Addr) error {
+	switch t := addr.(type) {
+	case i2pkeys.I2PAddr:
+		client.StreamAddr = addr
+	case i2pkeys.I2PKeys:
+		client.StreamAddr = addr
+	case *net.TCPAddr:
+		client.StreamAddr = addr
+	default:
+		return fmt.Errorf("Wrong address type %s", t)
+	}
+	return fmt.Errorf("Wrong address type %s", addr)
 }
 
 // Internal disconnect function
@@ -391,7 +428,7 @@ func (client *Client) SendUDP(buf []byte) error {
 	if client.udp {
 		crypted := make([]byte, len(buf)+client.crypt.Overhead())
 		client.crypt.Encrypt(crypted, buf)
-		return client.server.SendUDP(crypted, client.udpaddr)
+		return client.server.SendDatagram(crypted, client.PacketAddr)
 	} else {
 		return client.sendMessage(buf)
 	}
@@ -510,7 +547,7 @@ func (client *Client) tlsRecvLoop() {
 				Release:     proto.String("Grumble"),
 				CryptoModes: cryptstate.SupportedModes(),
 			}
-			if client.server.cfg.BoolValue("SendOSInfo") {
+			if client.server.Config.BoolValue("SendOSInfo") {
 				version.Os = proto.String(runtime.GOOS)
 				version.OsVersion = proto.String("(Unknown version)")
 			}

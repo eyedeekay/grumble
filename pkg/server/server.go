@@ -16,13 +16,19 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/eyedeekay/sam3"
+	"github.com/eyedeekay/sam3/helper"
+	"github.com/eyedeekay/sam3/i2pkeys"
 
 	"github.com/golang/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
@@ -58,20 +64,37 @@ type KeyValuePair struct {
 	Reset bool
 }
 
+func (s *Server) StreamListener() net.Listener {
+	return s.streamListener
+}
+
+func (s *Server) TLSStreamListener() net.Listener {
+	return s.tLSStreamListener
+}
+
+func (s *Server) DatagramConnection() net.PacketConn {
+	return s.datagramConnection
+}
+
 // A Murmur server instance
 type Server struct {
 	Id int64
 
-	tcpl      net.Listener
-	tlsl      net.Listener
-	udpconn   net.PacketConn
-	tlscfg    *tls.Config
-	webwsl    *web.Listener
-	webtlscfg *tls.Config
-	webhttp   *http.Server
-	bye       chan bool
-	netwg     sync.WaitGroup
-	running   bool
+	streamListener     net.Listener
+	tLSStreamListener  net.Listener
+	datagramConnection net.PacketConn
+	webListener        net.Listener
+	TLSConfig          *tls.Config
+	WebSocketListener  *web.Listener
+	WebSocketTLSConfig *tls.Config
+	WebServer          *http.Server
+	SAM                *sam3.SAM
+	i2p                bool
+	i2pkeys            string
+
+	bye     chan bool
+	netwg   sync.WaitGroup
+	running bool
 
 	incoming       chan *Message
 	voicebroadcast chan *VoiceBroadcast
@@ -83,7 +106,7 @@ type Server struct {
 	clientAuthenticated chan *Client
 
 	// Server configuration
-	cfg *serverconf.Config
+	Config *serverconf.Config
 
 	// Clients
 	clients map[uint32]*Client
@@ -139,13 +162,14 @@ func (lf clientLogForwarder) Write(incoming []byte) (int, error) {
 }
 
 // Allocate a new Murmur instance
-func NewServer(id int64, datadir string) (s *Server, err error) {
+func NewAnonServer(id int64, datadir string) (s *Server, err error) {
 	s = new(Server)
 
 	s.Id = id
 	s.datadir = datadir
+	s.i2pkeys = filepath.Join(datadir, "anonymous")
 
-	s.cfg = serverconf.New(nil)
+	s.Config = serverconf.New(nil)
 
 	s.Users = make(map[uint32]*User)
 	s.UserCertMap = make(map[string]*User)
@@ -157,6 +181,34 @@ func NewServer(id int64, datadir string) (s *Server, err error) {
 	s.Channels = make(map[int]*Channel)
 	s.Channels[0] = NewChannel(0, "Root")
 	s.nextChanId = 1
+	s.i2p = true
+	s.Config.Set("I2P", "true")
+
+	s.Logger = log.New(logtarget.Default, fmt.Sprintf("[%v] ", s.Id), log.LstdFlags|log.Lmicroseconds)
+
+	return
+}
+
+// Allocate a new Murmur instance
+func NewServer(id int64, datadir string) (s *Server, err error) {
+	s = new(Server)
+
+	s.Id = id
+	s.datadir = datadir
+
+	s.Config = serverconf.New(nil)
+
+	s.Users = make(map[uint32]*User)
+	s.UserCertMap = make(map[string]*User)
+	s.UserNameMap = make(map[string]*User)
+	s.Users[0], err = NewUser(0, "SuperUser")
+	s.UserNameMap["SuperUser"] = s.Users[0]
+	s.nextUserId = 1
+
+	s.Channels = make(map[int]*Channel)
+	s.Channels[0] = NewChannel(0, "Root")
+	s.nextChanId = 1
+	s.i2p = false
 
 	s.Logger = log.New(logtarget.Default, fmt.Sprintf("[%v] ", s.Id), log.LstdFlags|log.Lmicroseconds)
 
@@ -192,7 +244,7 @@ func (server *Server) setConfigPassword(key, password string) {
 
 	// Could be racy, but shouldn't really matter...
 	val := "sha1$" + salt + "$" + digest
-	server.cfg.Set(key, val)
+	server.Config.Set(key, val)
 
 	if server.cfgUpdate != nil {
 		server.cfgUpdate <- &KeyValuePair{Key: key, Value: val}
@@ -210,7 +262,7 @@ func (server *Server) SetServerPassword(password string) {
 }
 
 func (server *Server) checkConfigPassword(key, password string) bool {
-	parts := strings.Split(server.cfg.StringValue(key), "$")
+	parts := strings.Split(server.Config.StringValue(key), "$")
 	if len(parts) != 3 {
 		return false
 	}
@@ -259,7 +311,7 @@ func (server *Server) CheckServerPassword(password string) bool {
 }
 
 func (server *Server) hasServerPassword() bool {
-	return server.cfg.StringValue("ServerPassword") != ""
+	return server.Config.StringValue("ServerPassword") != ""
 }
 
 // Called by the server to initiate a new client connection.
@@ -277,7 +329,10 @@ func (server *Server) handleIncomingClient(conn net.Conn) (err error) {
 	client.session = server.pool.Get()
 	client.Printf("New connection: %v (%v)", conn.RemoteAddr(), client.Session())
 
-	client.tcpaddr = addr.(*net.TCPAddr)
+	err = client.SetStreamAddr(addr)
+	if err != nil {
+		return
+	}
 	client.server = server
 	client.conn = conn
 	client.reader = bufio.NewReader(client.conn)
@@ -327,7 +382,7 @@ func (server *Server) handleIncomingClient(conn net.Conn) (err error) {
 // internal representation.
 func (server *Server) RemoveClient(client *Client, kicked bool) {
 	server.hmutex.Lock()
-	host := client.tcpaddr.IP.String()
+	host := GetIP(client.StreamAddr).String()
 	oldclients := server.hclients[host]
 	newclients := []*Client{}
 	for _, hostclient := range oldclients {
@@ -336,8 +391,8 @@ func (server *Server) RemoveClient(client *Client, kicked bool) {
 		}
 	}
 	server.hclients[host] = newclients
-	if client.udpaddr != nil {
-		delete(server.hpclients, client.udpaddr.String())
+	if client.PacketAddr != nil {
+		delete(server.hpclients, client.PacketAddr.String())
 	}
 	server.hmutex.Unlock()
 
@@ -624,7 +679,7 @@ func (server *Server) finishAuthenticate(client *Client) {
 	client.sendChannelList()
 
 	// Add the client to the host slice for its host address.
-	host := client.tcpaddr.IP.String()
+	host := GetIP(client.StreamAddr).String()
 	server.hmutex.Lock()
 	server.hclients[host] = append(server.hclients[host], client)
 	server.hmutex.Unlock()
@@ -686,8 +741,8 @@ func (server *Server) finishAuthenticate(client *Client) {
 
 	sync := &mumbleproto.ServerSync{}
 	sync.Session = proto.Uint32(client.Session())
-	sync.MaxBandwidth = proto.Uint32(server.cfg.Uint32Value("MaxBandwidth"))
-	sync.WelcomeText = proto.String(server.cfg.StringValue("WelcomeText"))
+	sync.MaxBandwidth = proto.Uint32(server.Config.Uint32Value("MaxBandwidth"))
+	sync.WelcomeText = proto.String(server.Config.StringValue("WelcomeText"))
 	if client.IsSuperUser() {
 		sync.Permissions = proto.Uint64(uint64(acl.AllPermissions))
 	} else {
@@ -704,9 +759,9 @@ func (server *Server) finishAuthenticate(client *Client) {
 	}
 
 	err := client.sendMessage(&mumbleproto.ServerConfig{
-		AllowHtml:          proto.Bool(server.cfg.BoolValue("AllowHTML")),
-		MessageLength:      proto.Uint32(server.cfg.Uint32Value("MaxTextMessageLength")),
-		ImageMessageLength: proto.Uint32(server.cfg.Uint32Value("MaxImageMessageLength")),
+		AllowHtml:          proto.Bool(server.Config.BoolValue("AllowHTML")),
+		MessageLength:      proto.Uint32(server.Config.Uint32Value("MaxTextMessageLength")),
+		ImageMessageLength: proto.Uint32(server.Config.Uint32Value("MaxImageMessageLength")),
 	})
 	if err != nil {
 		client.Panicf("%v", err)
@@ -975,8 +1030,8 @@ func (server *Server) handleIncomingMessage(client *Client, msg *Message) {
 }
 
 // Send the content of buf as a UDP packet to addr.
-func (s *Server) SendUDP(buf []byte, addr *net.UDPAddr) (err error) {
-	_, err = s.udpconn.WriteTo(buf, addr)
+func (s *Server) SendDatagram(buf []byte, addr net.Addr) (err error) {
+	_, err = s.DatagramConnection().WriteTo(buf, addr)
 	return
 }
 
@@ -986,7 +1041,7 @@ func (server *Server) udpListenLoop() {
 
 	buf := make([]byte, UDPPacketSize)
 	for {
-		nread, remote, err := server.udpconn.ReadFrom(buf)
+		nread, remote, err := server.DatagramConnection().ReadFrom(buf)
 		if err != nil {
 			if isTimeout(err) {
 				continue
@@ -995,7 +1050,7 @@ func (server *Server) udpListenLoop() {
 			}
 		}
 
-		udpaddr, ok := remote.(*net.UDPAddr)
+		PacketAddr, ok := remote.(*net.UDPAddr)
 		if !ok {
 			server.Printf("No UDPAddr in read packet. Disabling UDP. (Windows?)")
 			return
@@ -1015,21 +1070,21 @@ func (server *Server) udpListenLoop() {
 			_ = binary.Write(buffer, binary.BigEndian, uint32((1<<16)|(2<<8)|2))
 			_ = binary.Write(buffer, binary.BigEndian, rand)
 			_ = binary.Write(buffer, binary.BigEndian, uint32(len(server.clients)))
-			_ = binary.Write(buffer, binary.BigEndian, server.cfg.Uint32Value("MaxUsers"))
-			_ = binary.Write(buffer, binary.BigEndian, server.cfg.Uint32Value("MaxBandwidth"))
+			_ = binary.Write(buffer, binary.BigEndian, server.Config.Uint32Value("MaxUsers"))
+			_ = binary.Write(buffer, binary.BigEndian, server.Config.Uint32Value("MaxBandwidth"))
 
-			err = server.SendUDP(buffer.Bytes(), udpaddr)
+			err = server.SendDatagram(buffer.Bytes(), PacketAddr)
 			if err != nil {
 				return
 			}
 
 		} else {
-			server.handleUdpPacket(udpaddr, buf[0:nread])
+			server.handleUdpPacket(PacketAddr, buf[0:nread])
 		}
 	}
 }
 
-func (server *Server) handleUdpPacket(udpaddr *net.UDPAddr, buf []byte) {
+func (server *Server) handleUdpPacket(PacketAddr *net.UDPAddr, buf []byte) {
 	var match *Client
 	plain := make([]byte, len(buf))
 
@@ -1041,7 +1096,7 @@ func (server *Server) handleUdpPacket(udpaddr *net.UDPAddr, buf []byte) {
 	// which maps a host address to a slice of clients.
 	server.hmutex.Lock()
 	defer server.hmutex.Unlock()
-	client, ok := server.hpclients[udpaddr.String()]
+	client, ok := server.hpclients[PacketAddr.String()]
 	if ok {
 		err := client.crypt.Decrypt(plain, buf)
 		if err != nil {
@@ -1051,7 +1106,7 @@ func (server *Server) handleUdpPacket(udpaddr *net.UDPAddr, buf []byte) {
 		}
 		match = client
 	} else {
-		host := udpaddr.IP.String()
+		host := PacketAddr.IP.String()
 		hostclients := server.hclients[host]
 		for _, client := range hostclients {
 			err := client.crypt.Decrypt(plain[0:], buf)
@@ -1064,8 +1119,8 @@ func (server *Server) handleUdpPacket(udpaddr *net.UDPAddr, buf []byte) {
 			}
 		}
 		if match != nil {
-			match.udpaddr = udpaddr
-			server.hpclients[udpaddr.String()] = match
+			match.PacketAddr = PacketAddr
+			server.hpclients[PacketAddr.String()] = match
 		}
 	}
 
@@ -1268,9 +1323,14 @@ func (server *Server) IsConnectionBanned(conn net.Conn) bool {
 	defer server.banlock.RUnlock()
 
 	for _, ban := range server.Bans {
-		addr := conn.RemoteAddr().(*net.TCPAddr)
-		if ban.Match(addr.IP) && !ban.IsExpired() {
-			return true
+		switch conn.RemoteAddr().(type) {
+		case *net.TCPAddr:
+			addr := conn.RemoteAddr().(*net.TCPAddr)
+			if ban.Match(addr.IP) && !ban.IsExpired() {
+				return true
+			}
+		default:
+			return false
 		}
 	}
 
@@ -1294,9 +1354,9 @@ func (server *Server) IsCertHashBanned(hash string) bool {
 // Filter incoming text according to the server's current rules.
 func (server *Server) FilterText(text string) (filtered string, err error) {
 	options := &htmlfilter.Options{
-		StripHTML:             !server.cfg.BoolValue("AllowHTML"),
-		MaxTextMessageLength:  server.cfg.IntValue("MaxTextMessageLength"),
-		MaxImageMessageLength: server.cfg.IntValue("MaxImageMessageLength"),
+		StripHTML:             !server.Config.BoolValue("AllowHTML"),
+		MaxTextMessageLength:  server.Config.IntValue("MaxTextMessageLength"),
+		MaxImageMessageLength: server.Config.IntValue("MaxImageMessageLength"),
 	}
 	return htmlfilter.Filter(text, options)
 }
@@ -1381,7 +1441,7 @@ func (server *Server) cleanPerLaunchData() {
 // Port returns the port the native server will listen on when it is
 // started.
 func (server *Server) Port() int {
-	port := server.cfg.IntValue("Port")
+	port := server.Config.IntValue("Port")
 	if port == 0 {
 		return DefaultPort + int(server.Id) - 1
 	}
@@ -1391,13 +1451,13 @@ func (server *Server) Port() int {
 // ListenWebPort returns true if we should listen to the
 // web port, otherwise false
 func (server *Server) ListenWebPort() bool {
-	return !server.cfg.BoolValue("NoWebServer")
+	return !server.Config.BoolValue("NoWebServer")
 }
 
 // WebPort returns the port the web server will listen on when it is
 // started.
 func (server *Server) WebPort() int {
-	port := server.cfg.IntValue("WebPort")
+	port := server.Config.IntValue("WebPort")
 	if port == 0 {
 		return DefaultWebPort + int(server.Id) - 1
 	}
@@ -1411,19 +1471,183 @@ func (server *Server) CurrentPort() int {
 	if !server.running {
 		return -1
 	}
-	tcpaddr := server.tcpl.Addr().(*net.TCPAddr)
-	return tcpaddr.Port
+	if server.i2p {
+		return DefaultPort
+	}
+	switch server.StreamListener().Addr().(type) {
+	case *net.TCPAddr:
+		StreamAddr := server.StreamListener().Addr().(*net.TCPAddr)
+		return StreamAddr.Port
+	default:
+		return DefaultPort
+	}
 }
 
 // HostAddress returns the host address the server will listen on when
 // it is started. This must be an IP address, either IPv4
 // or IPv6.
 func (server *Server) HostAddress() string {
-	host := server.cfg.StringValue("Address")
+	host := server.Config.StringValue("Address")
 	if host == "" {
+		if server.i2p {
+			return "127.0.0.1"
+		}
 		return "0.0.0.0"
 	}
 	return host
+}
+
+func (server *Server) ListenDatagram(addr net.Addr) (net.PacketConn, error) {
+	switch addr.(type) {
+	case i2pkeys.I2PAddr:
+		return server.SAM.NewDatagramSession("mumble-i2p", addr.(i2pkeys.I2PKeys), sam3.Options_Humongous, 0)
+	case *i2pkeys.I2PKeys:
+		keys := addr.(*i2pkeys.I2PKeys)
+		newkeys := i2pkeys.NewKeys(keys.Addr(), keys.String())
+		return server.SAM.NewDatagramSession("mumble-i2p", newkeys, sam3.Options_Humongous, 0)
+	default:
+		return net.ListenUDP("udp", addr.(*net.UDPAddr))
+	}
+}
+
+func (server *Server) ListenStream(addr net.Addr) (net.Listener, error) {
+	switch addr.(type) {
+	case *i2pkeys.I2PKeys:
+		path := server.i2pkeys + ".stream"
+		return sam.I2PListener("mumble-stream", "127.0.0.1:7656", path)
+	default:
+		return net.ListenTCP("tcp", addr.(*net.TCPAddr))
+	}
+}
+
+func (server *Server) ListenWeb(addr net.Addr) (net.Listener, error) {
+	switch addr.(type) {
+	case *i2pkeys.I2PKeys:
+		path := server.i2pkeys + ".web"
+		return sam.I2PListener("mumble-web", "127.0.0.1:7656", path)
+	default:
+		return net.ListenTCP("tcp", addr.(*net.TCPAddr))
+	}
+}
+
+func (server *Server) DatagramAddr() net.Addr {
+	if server.i2p {
+		if _, err := os.Stat(server.i2pkeys + ".datagram.i2p.private"); os.IsNotExist(err) {
+			f, err := os.Create(server.i2pkeys + ".datagram.i2p.private")
+			if err != nil {
+				log.Fatalf("unable to open I2P keyfile for writing: %s", err)
+			}
+			defer f.Close()
+			tkeys, err := server.SAM.NewKeys()
+			if err != nil {
+				log.Fatalf("unable to generate I2P Keys, %s", err)
+			}
+			keys := &tkeys
+			err = i2pkeys.StoreKeysIncompat(*keys, f)
+			if err != nil {
+				log.Fatalf("unable to save newly generated I2P Keys, %s", err)
+			}
+			err = ioutil.WriteFile(server.i2pkeys+".datagram.i2p.public.txt", []byte(keys.Addr().Base32()), 0644)
+			if err != nil {
+				log.Fatalf("error storing I2P base32 address in adjacent text file, %s", err)
+			}
+			return keys
+		} else {
+			tkeys, err := i2pkeys.LoadKeys(server.i2pkeys + ".datagram.i2p.private")
+			if err != nil {
+				log.Fatalf("unable to load I2P Keys: %e", err)
+			}
+			keys := &tkeys
+			err = ioutil.WriteFile(server.i2pkeys+".datagram.i2p.public.txt", []byte(keys.Addr().Base32()), 0644)
+			if err != nil {
+				log.Fatalf("error storing I2P base32 address in adjacent text file, %s", err)
+			}
+			return keys
+		}
+	}
+	return &net.UDPAddr{IP: net.ParseIP(server.HostAddress()), Port: server.Port()}
+}
+
+func (server *Server) StreamAddrString() string {
+	return server.StreamAddr().(*i2pkeys.I2PKeys).Addr().Base32()
+}
+
+func (server *Server) StreamAddr() net.Addr {
+	if server.i2p {
+		if _, err := os.Stat(server.i2pkeys + ".stream.i2p.private"); os.IsNotExist(err) {
+			f, err := os.Create(server.i2pkeys + ".stream.i2p.private")
+			if err != nil {
+				log.Fatalf("unable to open I2P keyfile for writing: %s", err)
+			}
+			defer f.Close()
+			tkeys, err := server.SAM.NewKeys()
+			if err != nil {
+				log.Fatalf("unable to generate I2P Keys, %s", err)
+			}
+			keys := &tkeys
+			err = i2pkeys.StoreKeysIncompat(*keys, f)
+			if err != nil {
+				log.Fatalf("unable to save newly generated I2P Keys, %s", err)
+			}
+			return keys
+		} else {
+			tkeys, err := i2pkeys.LoadKeys(server.i2pkeys + ".stream.i2p.private")
+			if err != nil {
+				log.Fatalf("unable to load I2P Keys: %e", err)
+			}
+			keys := &tkeys
+			return keys
+		}
+	}
+	return &net.TCPAddr{IP: net.ParseIP(server.HostAddress()), Port: server.Port()}
+}
+
+func (server *Server) TLSAddrString() string {
+	switch server.WebAddr().(type) {
+	case *i2pkeys.I2PKeys:
+		return server.WebAddr().(*i2pkeys.I2PKeys).Addr().Base32()
+	default:
+		return server.WebAddr().String()
+	}
+}
+
+func (server *Server) WebAddrString() string {
+	switch server.WebAddr().(type) {
+	case *i2pkeys.I2PKeys:
+		return server.StreamAddr().(*i2pkeys.I2PKeys).Addr().Base32()
+	default:
+		return server.StreamAddr().String()
+	}
+}
+
+func (server *Server) WebAddr() net.Addr {
+	if server.i2p {
+		if _, err := os.Stat(server.i2pkeys + ".web.i2p.private"); os.IsNotExist(err) {
+			f, err := os.Create(server.i2pkeys + ".web.i2p.private")
+			if err != nil {
+				log.Fatalf("unable to open I2P keyfile for writing: %s", err)
+			}
+			defer f.Close()
+			tkeys, err := server.SAM.NewKeys()
+			if err != nil {
+				log.Fatalf("unable to generate I2P Keys, %s", err)
+			}
+			keys := &tkeys
+			err = i2pkeys.StoreKeysIncompat(*keys, f)
+			if err != nil {
+				log.Fatalf("unable to save newly generated I2P Keys, %s", err)
+			}
+			return keys
+		} else {
+			tkeys, err := i2pkeys.LoadKeys(server.i2pkeys + ".web.i2p.private")
+			if err != nil {
+				log.Fatalf("unable to load I2P Keys: %e", err)
+			}
+			keys := &tkeys
+			return keys
+		}
+	}
+	return &net.TCPAddr{IP: net.ParseIP(server.HostAddress()), Port: server.Port()}
 }
 
 // Start the server.
@@ -1432,30 +1656,39 @@ func (server *Server) Start() (err error) {
 		return errors.New("already running")
 	}
 
-	host := server.HostAddress()
-	port := server.Port()
-	webport := server.WebPort()
+	if server.i2p {
+		server.SAM, err = sam3.NewSAM("127.0.0.1:7656")
+		if err != nil {
+			return err
+		}
+	}
+
 	shouldListenWeb := server.ListenWebPort()
 
 	// Setup our UDP listener
-	server.udpconn, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP(host), Port: port})
+	server.datagramConnection, err = server.ListenDatagram(server.DatagramAddr())
 	if err != nil {
 		return err
 	}
 	/*
-		err = server.udpconn.SetReadTimeout(1e9)
+		err = server.DatagramConnection.SetReadTimeout(1e9)
 		if err != nil {
 			return err
 		}
 	*/
 
 	// Set up our TCP connection
-	server.tcpl, err = net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP(host), Port: port})
+	server.streamListener, err = server.ListenStream(server.StreamAddr())
+	if err != nil {
+		return err
+	}
+
+	server.webListener, err = server.ListenWeb(server.WebAddr())
 	if err != nil {
 		return err
 	}
 	/*
-		err = server.tcpl.SetTimeout(1e9)
+		err = server.StreamListener().SetTimeout(1e9)
 		if err != nil {
 			return err
 		}
@@ -1468,27 +1701,28 @@ func (server *Server) Start() (err error) {
 	if err != nil {
 		return err
 	}
-	server.tlscfg = &tls.Config{
+	server.TLSConfig = &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		ClientAuth:   tls.RequestClientCert,
+		ServerName:   server.TLSAddrString(),
 	}
-	server.tlsl = tls.NewListener(server.tcpl, server.tlscfg)
+	server.tLSStreamListener = tls.NewListener(server.StreamListener(), server.TLSConfig)
 
 	if shouldListenWeb {
 		// Create HTTP server and WebSocket "listener"
-		webaddr := &net.TCPAddr{IP: net.ParseIP(host), Port: webport}
-		server.webtlscfg = &tls.Config{
+		server.WebSocketTLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			ClientAuth:   tls.NoClientCert,
 			NextProtos:   []string{"http/1.1"},
+			ServerName:   server.WebAddrString(),
 		}
-		server.webwsl = web.NewListener(webaddr, server.Logger)
+		server.WebSocketListener = web.NewListener(server.WebAddr(), server.Logger)
 		mux := http.NewServeMux()
-		mux.Handle("/", server.webwsl)
-		server.webhttp = &http.Server{
-			Addr:      webaddr.String(),
+		mux.Handle("/", server.WebSocketListener)
+		server.WebServer = &http.Server{
+			Addr:      server.WebAddrString(),
 			Handler:   mux,
-			TLSConfig: server.webtlscfg,
+			TLSConfig: server.WebSocketTLSConfig,
 			ErrorLog:  server.Logger,
 
 			// Set sensible timeouts, in case no reverse proxy is in front of Grumble.
@@ -1499,15 +1733,15 @@ func (server *Server) Start() (err error) {
 			IdleTimeout:  2 * time.Minute,
 		}
 		go func() {
-			err := server.webhttp.ListenAndServeTLS("", "")
+			err := server.WebServer.ServeTLS(server.webListener, "", "")
 			if err != http.ErrServerClosed {
 				server.Fatalf("Fatal HTTP server error: %v", err)
 			}
 		}()
 
-		server.Printf("Started: listening on %v and %v", server.tcpl.Addr(), server.webwsl.Addr())
+		server.Printf("Started: listening on %v and %v", server.StreamListener().Addr(), server.WebSocketListener.Addr())
 	} else {
-		server.Printf("Started: listening on %v", server.tcpl.Addr())
+		server.Printf("Started: listening on %v", server.StreamListener().Addr())
 	}
 
 	server.running = true
@@ -1539,9 +1773,9 @@ func (server *Server) Start() (err error) {
 
 	server.netwg.Add(numWG)
 	go server.udpListenLoop()
-	go server.acceptLoop(server.tlsl)
+	go server.acceptLoop(server.TLSStreamListener())
 	if shouldListenWeb {
-		go server.acceptLoop(server.webwsl)
+		go server.acceptLoop(server.WebSocketListener)
 	}
 
 	// Schedule a server registration update (if needed)
@@ -1573,7 +1807,7 @@ func (server *Server) Stop() (err error) {
 	// all clients were disconnected.
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(15*time.Second))
 	if server.ListenWebPort() {
-		err = server.webhttp.Shutdown(ctx)
+		err = server.WebServer.Shutdown(ctx)
 		cancel()
 		if err == context.DeadlineExceeded {
 			server.Println("Forcibly shutdown HTTP server while stopping")
@@ -1581,20 +1815,20 @@ func (server *Server) Stop() (err error) {
 			return err
 		}
 
-		err = server.webwsl.Close()
+		err = server.WebSocketListener.Close()
 		if err != nil {
 			return err
 		}
 	}
 
 	// Close the listeners
-	err = server.tlsl.Close()
+	err = server.TLSStreamListener().Close()
 	if err != nil {
 		return err
 	}
 
 	// Close the UDP connection
-	err = server.udpconn.Close()
+	err = server.DatagramConnection().Close()
 	if err != nil {
 		return err
 	}
@@ -1620,5 +1854,5 @@ func (server *Server) Stop() (err error) {
 
 // Set will set a configuration value
 func (server *Server) Set(key string, value string) {
-	server.cfg.Set(key, value)
+	server.Config.Set(key, value)
 }

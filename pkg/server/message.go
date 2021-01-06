@@ -11,6 +11,8 @@ import (
 	"net"
 	"time"
 
+	"github.com/eyedeekay/sam3/i2pkeys"
+
 	"github.com/golang/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/ban"
@@ -596,7 +598,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 			return
 		}
 
-		maxChannelUsers := server.cfg.IntValue("MaxChannelUsers")
+		maxChannelUsers := server.Config.IntValue("MaxChannelUsers")
 		if maxChannelUsers != 0 && len(dstChan.clients) >= maxChannelUsers {
 			client.sendPermissionDeniedFallback(mumbleproto.PermissionDenied_ChannelFull,
 				0x010201, "Channel is full")
@@ -656,7 +658,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 
 	// Texture change
 	if userstate.Texture != nil {
-		maximg := server.cfg.IntValue("MaxImageMessageLength")
+		maximg := server.Config.IntValue("MaxImageMessageLength")
 		if maximg > 0 && len(userstate.Texture) > maximg {
 			client.sendPermissionDeniedType(mumbleproto.PermissionDenied_TextTooLong)
 			return
@@ -1381,7 +1383,8 @@ func (server *Server) handleUserStatsMessage(client *Client, msg *Message) {
 		stats.Version = version
 		stats.CeltVersions = target.codecs
 		stats.Opus = proto.Bool(target.opus)
-		stats.Address = target.tcpaddr.IP
+		stats.Address = GetIP(target.StreamAddr)
+		//		stats.Address = target.StreamAddr.IP
 	}
 
 	// fixme(mkrautz): we don't do bandwidth tracking yet
@@ -1390,6 +1393,20 @@ func (server *Server) handleUserStatsMessage(client *Client, msg *Message) {
 		client.Panic(err)
 		return
 	}
+}
+
+func GetIP(addr net.Addr) net.IP {
+	switch addr.(type) {
+	case *net.TCPAddr:
+		return addr.(*net.TCPAddr).IP
+	case *net.UDPAddr:
+		return addr.(*net.UDPAddr).IP
+	case i2pkeys.I2PAddr:
+		return net.ParseIP("127.0.0.1")
+	case i2pkeys.I2PKeys:
+		return net.ParseIP("127.0.0.1")
+	}
+	return net.ParseIP("127.0.0.1")
 }
 
 // Voice target message
